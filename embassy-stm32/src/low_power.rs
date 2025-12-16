@@ -43,7 +43,7 @@
 use core::arch::asm;
 use core::marker::PhantomData;
 use core::mem;
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 use cortex_m::peripheral::SCB;
 use critical_section::CriticalSection;
@@ -56,7 +56,27 @@ use crate::time_driver::get_driver;
 
 const THREAD_PENDER: usize = usize::MAX;
 
-static mut EXECUTOR_TAKEN: bool = false;
+static EXECUTOR_TAKEN: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "low-power-pender")]
+static TASKS_PENDING: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "low-power-pender")]
+#[unsafe(export_name = "__pender")]
+fn __pender(context: *mut ()) {
+    unsafe {
+        // Safety: `context` is either `usize::MAX` created by `Executor::run`, or a valid interrupt
+        // request number given to `InterruptExecutor::start`.
+
+        let context = context as usize;
+
+        // Try to make Rust optimize the branching away if we only use thread mode.
+        if context == THREAD_PENDER {
+            TASKS_PENDING.store(true, Ordering::Release);
+            core::arch::asm!("sev");
+            return;
+        }
+    }
+}
 
 /// Prevent the device from going into the stop mode if held
 pub struct DeviceBusy {
@@ -124,9 +144,9 @@ impl Into<Lpms> for StopMode {
     fn into(self) -> Lpms {
         match self {
             StopMode::Stop1 => Lpms::STOP1,
-            #[cfg(not(any(stm32wb, stm32wba)))]
+            #[cfg(not(stm32wba))]
             StopMode::Standby | StopMode::Stop2 => Lpms::STOP2,
-            #[cfg(any(stm32wb, stm32wba))]
+            #[cfg(stm32wba)]
             StopMode::Standby | StopMode::Stop2 => Lpms::STOP1, // TODO: WBA has no STOP2?
         }
     }
@@ -150,12 +170,10 @@ pub struct Executor {
 impl Executor {
     /// Create a new Executor.
     pub fn new() -> Self {
-        unsafe {
-            if EXECUTOR_TAKEN {
-                panic!("Low power executor can only be taken once.");
-            } else {
-                EXECUTOR_TAKEN = true;
-            }
+        if EXECUTOR_TAKEN.load(Ordering::Acquire) {
+            panic!("Low power executor can only be taken once.");
+        } else {
+            EXECUTOR_TAKEN.store(true, Ordering::Release);
         }
 
         Self {
@@ -170,24 +188,44 @@ impl Executor {
         }
 
         critical_section::with(|cs| {
-            #[cfg(stm32wlex)]
+            #[cfg(any(stm32wlex, stm32wb))]
             {
                 let es = crate::pac::PWR.extscr().read();
+                #[cfg(stm32wlex)]
                 match (es.c1stopf(), es.c1stop2f()) {
                     (true, false) => debug!("low power: wake from STOP1"),
                     (false, true) => debug!("low power: wake from STOP2"),
                     (true, true) => debug!("low power: wake from STOP1 and STOP2 ???"),
                     (false, false) => trace!("low power: stop mode not entered"),
                 };
+
+                #[cfg(stm32wb)]
+                match (es.c1stopf(), es.c2stopf()) {
+                    (true, false) => debug!("low power: cpu1 wake from STOP"),
+                    (false, true) => debug!("low power: cpu2 wake from STOP"),
+                    (true, true) => debug!("low power: cpu1 and cpu2 wake from STOP"),
+                    (false, false) => trace!("low power: stop mode not entered"),
+                };
                 crate::pac::PWR.extscr().modify(|w| {
                     w.set_c1cssf(false);
                 });
 
-                if es.c1stop2f() || es.c1stopf() {
+                let has_stopped2 = {
+                    #[cfg(stm32wb)]
+                    {
+                        es.c2stopf()
+                    }
+
+                    #[cfg(stm32wlex)]
+                    {
+                        es.c1stop2f()
+                    }
+                };
+
+                if es.c1stopf() || has_stopped2 {
                     // when we wake from any stop mode we need to re-initialize the rcc
                     crate::rcc::init(RCC_CONFIG.unwrap());
-
-                    if es.c1stop2f() {
+                    if has_stopped2 {
                         // when we wake from STOP2, we need to re-initialize the time driver
                         get_driver().init_timer(cs);
                         // reset the refcounts for STOP2 and STOP1 (initializing the time driver will increment one of them for the timer)
@@ -276,6 +314,20 @@ impl Executor {
 
         drop(sem3_mutex);
 
+        // on PWR
+        RCC.apb1enr1().modify(|r| r.0 |= 1 << 28);
+        cortex_m::asm::dsb();
+
+        // off SMPS, on Bypass
+        PWR.cr5().modify(|r| {
+            let mut val = r.0;
+            val &= !(1 << 15); // sdeb = 0 (off SMPS)
+            val |= 1 << 14; // sdben = 1 (on Bypass)
+            r.0 = val
+        });
+
+        cortex_m::asm::delay(1000);
+
         Ok(())
     }
 
@@ -304,7 +356,14 @@ impl Executor {
             w.set_c1cssf(true);
         });
 
-        compiler_fence(Ordering::SeqCst);
+        #[cfg(feature = "low-power-pender")]
+        if TASKS_PENDING.load(Ordering::Acquire) {
+            TASKS_PENDING.store(false, Ordering::Release);
+
+            return;
+        }
+
+        compiler_fence(Ordering::Acquire);
 
         critical_section::with(|cs| {
             let _ = unsafe { RCC_CONFIG }?;
