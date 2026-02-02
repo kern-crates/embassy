@@ -1,7 +1,7 @@
-name: Matrix bot
+name: Matrix bot for issues
 on:
-  pull_request_target:
-    types: [opened, closed]
+  issues:
+    types: [opened]
 
 jobs:
   notify:
@@ -14,18 +14,17 @@ jobs:
         with:
           script: |
             const action = context.payload.action;
-            const merged = context.payload.pull_request.merged;
-            const title = context.payload.pull_request.title;
-            const url = context.payload.pull_request.html_url;
+            const title = context.payload.issue.title;
+            const issueBody = context.payload.issue.body;
+            const url = context.payload.issue.html_url;
 
             // Determine message prefix
             let prefix;
-            if (action === 'opened') {
-              prefix = 'New PR';
-            } else if (action === 'closed' && merged) {
-              prefix = 'PR merged';
-            } else if (action === 'closed' && !merged) {
-              prefix = 'PR closed without merging';
+            let roomId;
+            if (action === 'opened' && (title + ' ' + issueBody).toLowerCase().includes('esp32')) {
+              // Nag danielb
+              prefix = 'New Issue';
+              roomId = '!oENPKPHeKwiPfIVHER:matrix.org';
             } else {
               return; // Unknown action, skip
             }
@@ -41,7 +40,6 @@ jobs:
             const body = `${prefix}: ${title} - ${url}`;
             const formattedBody = `${prefix}: <a href="${url}">${titleEscaped}</a>`;
 
-            const roomId = '!YoLPkieCYHGzdjUhOK:matrix.org';
             const accessToken = process.env.MATRIX_ACCESS_TOKEN;
 
             const response = await fetch(
