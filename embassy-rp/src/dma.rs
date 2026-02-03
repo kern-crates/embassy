@@ -64,13 +64,18 @@ impl<'d> Channel<'d> {
     }
 
     /// Get the channel number.
-    pub(crate) fn number(&self) -> u8 {
+    fn number(&self) -> u8 {
         self.number
     }
 
     /// Get the channel register block.
-    pub(crate) fn regs(&self) -> pac::dma::Channel {
+    fn regs(&self) -> pac::dma::Channel {
         pac::DMA.ch(self.number as _)
+    }
+
+    /// Get next write address.
+    pub fn write_addr(&self) -> u32 {
+        self.regs().write_addr().read()
     }
 
     /// Reborrow the channel, allowing it to be used in multiple places.
@@ -144,10 +149,10 @@ impl<'d> Channel<'d> {
         Transfer::new(self.reborrow())
     }
 
-    /// DMA repeated read from peripheral.
+    /// Repetedly read from a peripheral to discard data.
     ///
     /// SAFETY: `from` must point to a valid location reachable by DMA.
-    pub unsafe fn read_repeated<'a, W: Word>(
+    pub unsafe fn read_discard<'a, W: Word>(
         &'a mut self,
         from: *mut W,
         len: usize,
@@ -192,10 +197,10 @@ impl<'d> Channel<'d> {
         Transfer::new(self.reborrow())
     }
 
-    /// DMA repeated write of the same value from memory to a peripheral.
+    /// Repetedly write 0 to peripeheral.
     ///
     /// SAFETY: `to` must point to a valid location reachable by DMA.
-    pub unsafe fn write_repeated<'a, W: Word>(
+    pub unsafe fn write_zeros<'a, W: Word>(
         &'a mut self,
         count: usize,
         to: *mut W,
