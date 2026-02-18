@@ -1,10 +1,9 @@
-use core::future::Future;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use embassy_hal_internal::atomic_ring_buffer::RingBuffer;
 use embassy_hal_internal::{Peri, PeripheralType};
-use embassy_sync::waitqueue::AtomicWaker;
+use maitake_sync::WaitCell;
 use nxp_pac::lpuart::vals::Dozeen;
 use paste::paste;
 
@@ -37,9 +36,9 @@ trait SealedInstance {
 }
 
 struct State {
-    tx_waker: AtomicWaker,
+    tx_waker: WaitCell,
     tx_buf: RingBuffer,
-    rx_waker: AtomicWaker,
+    rx_waker: WaitCell,
     rx_buf: RingBuffer,
     tx_rx_refmask: TxRxRefMask,
 }
@@ -94,9 +93,9 @@ impl State {
     /// Create a new state instance
     pub const fn new() -> Self {
         Self {
-            tx_waker: AtomicWaker::new(),
+            tx_waker: WaitCell::new(),
             tx_buf: RingBuffer::new(),
-            rx_waker: AtomicWaker::new(),
+            rx_waker: WaitCell::new(),
             rx_buf: RingBuffer::new(),
             tx_rx_refmask: TxRxRefMask::new(),
         }
@@ -225,11 +224,13 @@ fn configure_control_settings(info: &'static Info, config: &Config) {
 
         // Allow the lpuart to wake from deep sleep if configured to
         // work in deep sleep mode.
-        let enable_doze = match config.power {
-            PoweredClock::NormalEnabledDeepSleepDisabled => Dozeen::DISABLED,
-            PoweredClock::AlwaysEnabled => Dozeen::ENABLED,
-        };
-        w.set_dozeen(enable_doze);
+        //
+        // NOTE: this is the default state, and setting this to `Dozeen::DISABLED`
+        // seems to actively *stop* the uart, regardless of whether automatic clock
+        // gating is used, or if the device never goes to deep sleep at all (e.g.
+        // in WfeUngated configuration). For now, let's not touch this unless we
+        // actually need to, e.g. *forcing* the lpuart to sleep!
+        w.set_dozeen(Dozeen::ENABLED);
 
         // Data bits configuration
         match config.data_bits_count {
@@ -621,6 +622,14 @@ pub enum Error {
     TxBusy,
     /// Clock Error
     ClockSetup(ClockError),
+    /// Other internal errors or unexpected state.
+    Other,
+}
+
+impl From<maitake_sync::Closed> for Error {
+    fn from(_value: maitake_sync::Closed) -> Self {
+        Error::Other
+    }
 }
 
 impl core::fmt::Display for Error {
@@ -638,6 +647,7 @@ impl core::fmt::Display for Error {
             Error::TxFifoFull => write!(f, "TX FIFO full"),
             Error::TxBusy => write!(f, "TX busy"),
             Error::ClockSetup(e) => write!(f, "Clock setup error: {:?}", e),
+            Error::Other => write!(f, "Other error"),
         }
     }
 }
